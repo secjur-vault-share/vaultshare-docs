@@ -10,6 +10,7 @@ system is built the way it is.
 |---|---|
 | [ARCHITECTURE.md](ARCHITECTURE.md) | Full system architecture, data models, API design, and 9-phase implementation plan |
 | [DESIGN_DECISIONS.md](DESIGN_DECISIONS.md) | Reasoning behind every significant architectural choice and documented trade-offs |
+| [django_admin_plan.md](django_admin_plan.md) | Implementation plan for the Django Admin interface |
 | [backend-take-home-task_v1.1 (1).md](<backend-take-home-task_v1.1%20(1).md>) | Original SECJUR engineering challenge specification |
 
 ## Implementation History
