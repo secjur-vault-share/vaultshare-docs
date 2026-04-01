@@ -22,6 +22,7 @@ the detailed implementation plans used during development:
 | [phase2_implementation_plan.md](previous_implementation_phases/phase2_implementation_plan.md) | Accounts & Storage Abstraction |
 | [phase3_implementation_plan.md](previous_implementation_phases/phase3_implementation_plan.md) | Core Files & Audit Trail |
 | [phase4_implementation_plan.md](previous_implementation_phases/phase4_implementation_plan.md) | Sharing & Permissions |
+| [phase5_implementation_plan.md](phase5_implementation_plan.md) | File Versioning |
 | [manual_testing_phase4.md](previous_implementation_phases/manual_testing_phase4.md) | Manual testing notes for Phase 4 |
 
 ## Related
