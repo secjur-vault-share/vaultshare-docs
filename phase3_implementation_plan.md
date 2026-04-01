@@ -279,22 +279,32 @@ def upload(
 ```
 
 Logic (in order):
-1. Detect MIME type from the file content (use `python-magic` or `mimetypes.guess_type`).
-2. Try `File.objects.get(owner=owner, folder=folder, name=name, deleted_at__isnull=True)`.
+1. **Sanitize the filename:** `safe_name = Path(name).name` — strips any directory
+   components (e.g. `../../etc/passwd` → `passwd`). Reject empty result with a
+   `ValidationError`. This is a service-level guard; `LocalDiskBackend` also blocks
+   traversal, but defence-in-depth applies here.
+2. Detect MIME type: `mime_type, _ = mimetypes.guess_type(safe_name)` — filename-only,
+   no bytes read. Falls back to `"application/octet-stream"` if unrecognised.
+3. **Compute size before saving:** `file_obj.seek(0, 2); size_bytes = file_obj.tell(); file_obj.seek(0)`.
+   This avoids a second storage round-trip (which would be a `HeadObject` call on S3).
+4. Try `File.objects.get(owner=owner, folder=folder, name=safe_name, deleted_at__isnull=True)`.
    - If **not found**: create new `File` (current_version=None).
    - If **found**: use the existing `File` for a new version (Phase 5 activates the
      version increment; for now a second upload to the same name raises
      `IntegrityError` — the DB constraint is the gate. Phase 5 handles the version
      path). **Important:** for Phase 3, treat same-name upload as a new version = 1
      for a fresh file. The re-upload scenario is a Phase 5 concern.
-3. Derive `version_number = 1` (Phase 5 will compute `max + 1`).
-4. Derive `storage_key = f"{owner.id}/{file_id}/1/{name}"`.
-5. Call `storage_backend.save(storage_key, file_obj)`.
-6. Get `size_bytes = storage_backend.size(storage_key)`.
-7. Create `FileVersion(file=file, version_number=1, storage_key=..., size_bytes=..., created_by=owner)`.
-8. Set `file.current_version = version` and `file.save()`.
-9. Call `AuditService.append(actor=owner, action=AuditAction.UPLOAD, target_type='file', target_id=file.id, target_name=file.name, ip=ip)`.
-10. Return `file`.
+5. Derive `version_number = 1` (Phase 5 will compute `max + 1`).
+6. Derive `storage_key = f"{owner.id}/{file.id}/1/{safe_name}"`.
+7. Call `file_obj.seek(0)` explicitly before passing to `storage_backend.save()`.
+   Django's multipart parser may have partially consumed the stream. This must be
+   called regardless of MIME detection method — it is not guaranteed that the upstream
+   `InMemoryUploadedFile` position is at 0.
+8. Call `storage_backend.save(storage_key, file_obj)`.
+9. Create `FileVersion(file=file, version_number=1, storage_key=..., size_bytes=size_bytes, created_by=owner)`.
+10. Set `file.current_version = version` and `file.save()`.
+11. Call `AuditService.append(actor=owner, action=AuditAction.UPLOAD, target_type='file', target_id=file.id, target_name=file.name, ip=ip)`.
+12. Return `file`.
 
 #### `FileService.download`
 
@@ -408,18 +418,77 @@ class UploadSerializer(serializers.Serializer):
 
 ```python
 def get(self, request, pk):
-    version, stream = FileService.download(user=request.user, file_id=pk, ip=get_client_ip(request))
-    response = StreamingHttpResponse(stream, content_type=file.mime_type or 'application/octet-stream')
+    file, version, stream = FileService.download(
+        user=request.user, file_id=pk, ip=get_client_ip(request)
+    )
+    response = StreamingHttpResponse(
+        stream, content_type=file.mime_type or 'application/octet-stream'
+    )
     response['Content-Disposition'] = f'attachment; filename="{file.name}"'
     return response
 ```
+
+`FileService.download` returns `(File, FileVersion, BinaryIO)`. The `file` object
+provides `file.mime_type` and `file.name` for the response headers.
 
 `StreamingHttpResponse` is used even for single-file downloads — it avoids loading the
 full file into memory and is consistent with the ZIP streaming pattern in Phase 6.
 
 ---
 
-### I. `apps/audit/views.py` and `apps/audit/serializers.py` — NEW FILES
+### I. Global Exception Handler (`apps/core/exceptions.py` + settings) — NEW FILE
+
+The architecture mandates `{"error": {"code": "...", "message": "..."}}` for all error
+responses. DRF's default error format does not follow this envelope. A global exception
+handler must be registered so that all views — including future ones — produce consistent
+errors without manual wrapping.
+
+**`apps/core/exceptions.py`:**
+
+```python
+from rest_framework.views import exception_handler as drf_exception_handler
+from rest_framework.exceptions import NotFound, PermissionDenied, ValidationError
+
+ERROR_CODE_MAP = {
+    NotFound: "NOT_FOUND",
+    PermissionDenied: "PERMISSION_DENIED",
+    ValidationError: "VALIDATION_FAILED",
+}
+
+def custom_exception_handler(exc, context):
+    response = drf_exception_handler(exc, context)
+    if response is not None:
+        code = ERROR_CODE_MAP.get(type(exc), "ERROR")
+        response.data = {"error": {"code": code, "message": str(exc.detail)}}
+    return response
+```
+
+**Register in `config/settings/base.py`:**
+
+```python
+REST_FRAMEWORK = {
+    ...
+    "EXCEPTION_HANDLER": "apps.core.exceptions.custom_exception_handler",
+}
+```
+
+**Error codes used in Phase 3:**
+
+| Condition | HTTP status | `code` |
+|---|---|---|
+| File not found (deleted or never existed) | 404 | `NOT_FOUND` |
+| Non-owner attempts download/delete | 403 | `PERMISSION_DENIED` |
+| Invalid upload input (missing file field) | 400 | `VALIDATION_FAILED` |
+| Audit access for unimplemented target_type | 403 | `PERMISSION_DENIED` |
+
+Views that call `FileService` methods should raise DRF exceptions
+(`rest_framework.exceptions.NotFound`, `PermissionDenied`) rather than Django's
+`Http404` or `django.core.exceptions.PermissionDenied`, so the global handler catches
+them correctly.
+
+---
+
+### J. `apps/audit/views.py` and `apps/audit/serializers.py` — NEW FILES
 
 #### `AuditLogSerializer`
 
@@ -433,17 +502,26 @@ class AuditLogSerializer(ModelSerializer):
                   'target_name', 'ip_address', 'metadata', 'created_at']
 ```
 
-#### `AuditLogListView` — `GET /audit/?target_id={uuid}`
+#### `AuditLogListView` — `GET /audit/?target_id={uuid}&target_type={type}`
 
-Access rule: the requesting user must be the owner of the target object. For Phase 3,
-this means verifying `File.objects.filter(pk=target_id, owner=request.user).exists()`.
-Phase 4 will extend this to handle shared files with OWNER permission.
+Required query params: `target_id` (UUID), `target_type` (string: `"file"`,
+`"folder"`, `"public_link"`).
+
+Access rule dispatches on `target_type`:
+- `"file"`: verify `File.objects.filter(pk=target_id, owner=request.user).exists()`
+- `"folder"` / `"public_link"`: **TODO** — return `403 PERMISSION_DENIED` with message
+  `"Audit access for this target_type is not yet implemented."` These cases are wired
+  in Phase 6 and Phase 7 respectively. The Phase 3 view must accept the parameter and
+  return a meaningful error rather than silently returning an empty list or 500.
+
+This explicit dispatch prevents the silent false-negative bug where a `target_id`
+belonging to a Folder returns an empty result set instead of an access-control error.
 
 Returns: `{"data": AuditLogSerializer(queryset, many=True).data}` ordered by `-created_at`.
 
 ---
 
-### J. URL Registration (`config/urls.py`)
+### K. URL Registration (`config/urls.py`)
 
 Add to `urlpatterns`:
 
@@ -472,7 +550,7 @@ urlpatterns = [
 
 ---
 
-### K. Django Admin (`apps/audit/admin.py`, `apps/storage/admin.py`) — NEW FILES
+### L. Django Admin (`apps/audit/admin.py`, `apps/storage/admin.py`) — NEW FILES
 
 #### `AuditLogAdmin`
 
@@ -505,7 +583,7 @@ class FileVersionAdmin(admin.ModelAdmin):
 
 ---
 
-### L. Settings Update (`config/settings/base.py`)
+### M. Settings Update (`config/settings/base.py`)
 
 Add to `base.py`:
 
@@ -515,12 +593,23 @@ DATA_UPLOAD_MAX_MEMORY_SIZE = 104857600
 FILE_UPLOAD_MAX_MEMORY_SIZE = 104857600
 ```
 
-No new `INSTALLED_APPS` entries needed — `apps.storage` and `apps.audit` are already
-registered.
+Add `EXCEPTION_HANDLER` to the existing `REST_FRAMEWORK` dict (do not duplicate the
+dict — extend it):
+
+```python
+REST_FRAMEWORK = {
+    "DEFAULT_AUTHENTICATION_CLASSES": (...),
+    "DEFAULT_PERMISSION_CLASSES": (...),
+    "EXCEPTION_HANDLER": "apps.core.exceptions.custom_exception_handler",  # ADD
+}
+```
+
+No new `INSTALLED_APPS` entries needed — `apps.core`, `apps.storage`, and `apps.audit`
+are already registered.
 
 ---
 
-### M. Dependencies (`pyproject.toml`)
+### N. Dependencies (`pyproject.toml`)
 
 Add to the `dependencies` array:
 - `python-magic>=0.4.27` — MIME type detection from file content (more reliable than
@@ -536,7 +625,7 @@ as a known limitation.
 
 ---
 
-### N. Helper: IP Extraction (`apps/core/utils.py`) — NEW FILE
+### O. Helper: IP Extraction (`apps/core/utils.py`) — NEW FILE
 
 ```python
 def get_client_ip(request: HttpRequest) -> str | None:
@@ -587,6 +676,15 @@ needed.
 **Update contract:** This command will be extended in Phases 4–7. Use `--reset` flag
 to wipe and re-seed cleanly. The idempotent path (no `--reset`) is for quick restarts.
 
+**Temporary non-compliance with the brief:** The take-home task requires at least 5 users,
+a realistic folder hierarchy, and 20+ audit log entries per user. Phase 3's seed
+intentionally delivers only 1 user and 5 files — the minimum needed to make `make verify`
+green. This is a known, temporary gap. A reviewer running `make seed` after Phase 3 and
+before Phase 6 will see a seed that does not satisfy the brief's demo data requirements.
+The full seed (5 users, folder hierarchy, 20+ entries/user) is delivered in Phase 6.
+This limitation must be noted in the Phase 3 seed command output (e.g. a log line:
+`"Seed v1: minimal demo data — full seed available after Phase 6"`).
+
 ---
 
 ## 6. Acceptance Tests (`tests/acceptance/test_core.py`)
@@ -595,15 +693,37 @@ to wipe and re-seed cleanly. The idempotent path (no `--reset`) is for quick res
 
 Uses `httpx` against `http://localhost:8000`. Assumes `make seed` has run.
 
+**Test isolation:** Each scenario that uploads a file must use a unique filename per
+run to avoid colliding with the `unique_active_file_per_folder` constraint on re-runs.
+Use a `fresh_filename` fixture that appends a UUID suffix:
+
+```python
+import uuid
+import pytest
+
+@pytest.fixture
+def fresh_filename():
+    """Returns a callable that generates a unique filename per test run."""
+    def _make(base: str, ext: str) -> str:
+        return f"{base}_{uuid.uuid4().hex[:8]}.{ext}"
+    return _make
+```
+
+All upload calls in acceptance tests must use `fresh_filename("test", "txt")` rather
+than a hardcoded `"test.txt"`. This makes `make verify` safely re-runnable against a
+live stack without a teardown step.
+
 ```python
 # Setup fixture: login as demo@vaultshare.io, return Bearer token
+
 # Scenario 1: Upload → Download round-trip
-def test_upload_download_roundtrip(auth_headers):
+def test_upload_download_roundtrip(auth_headers, fresh_filename):
     content = b"vaultshare acceptance test payload"
+    filename = fresh_filename("roundtrip", "txt")
     response = httpx.post(
         "http://localhost:8000/api/v1/files/",
         headers=auth_headers,
-        files={"file": ("test.txt", content, "text/plain")},
+        files={"file": (filename, content, "text/plain")},
     )
     assert response.status_code == 201
     file_id = response.json()["data"]["id"]
@@ -612,17 +732,17 @@ def test_upload_download_roundtrip(auth_headers):
     assert dl.status_code == 200
     assert dl.content == content
 
-# Scenario 2: Soft delete → absent from listing → still in DB
-def test_soft_delete(auth_headers):
-    # upload
-    # delete → 204
-    # GET /files/ → file not present in list
-    # (DB check is done by the seed/unit tests — acceptance tests verify HTTP boundary only)
+# Scenario 2: Soft delete → absent from listing
+def test_soft_delete(auth_headers, fresh_filename):
+    # upload with fresh_filename("softdelete", "txt")
+    # DELETE /files/{id}/ → 204
+    # GET /files/ → assert file_id not in [f["id"] for f in response.json()["data"]]
+    # (DB-level check is covered by integration tests — acceptance tests verify HTTP boundary only)
 
 # Scenario 3: Upload → AuditLog entry exists
-def test_audit_log_on_upload(auth_headers):
-    # upload a file
-    # GET /api/v1/audit/?target_id={file_id}
+def test_audit_log_on_upload(auth_headers, fresh_filename):
+    # upload with fresh_filename("auditcheck", "txt")
+    # GET /api/v1/audit/?target_id={file_id}&target_type=file
     # assert at least one entry with action == 'UPLOAD'
 ```
 
@@ -665,27 +785,28 @@ No changes needed.
 The implementer must follow this sequence to avoid circular import issues:
 
 1. `apps/core/models.py` — `BaseModel`
-2. `apps/audit/models.py` — `AuditAction`, `AuditLog`, `AuditLogQuerySet`, `AuditLogManager`
-3. `apps/audit/services.py` — `AuditService.append`
-4. `apps/storage/models.py` — `Folder`, `File`, `FileVersion`
-5. `apps/storage/services.py` — `get_storage_backend` factory, then `FileService`
-6. `apps/core/utils.py` — `get_client_ip`
-7. `apps/storage/serializers.py`
-8. `apps/storage/views.py`
-9. `apps/storage/urls.py`
-10. `apps/audit/serializers.py`
-11. `apps/audit/views.py`
-12. `apps/audit/urls.py`
-13. `apps/storage/admin.py`, `apps/audit/admin.py`
-14. `config/urls.py` — add includes
-15. `config/settings/base.py` — add upload size limits
-16. `makemigrations` + `migrate`
-17. `apps/core/management/commands/seed.py`
-18. `tests/unit/test_audit.py`
-19. `tests/integration/test_files.py`
-20. `tests/acceptance/test_core.py`
-21. `make check` (ruff + mypy) — must pass clean
-22. `make verify` — must be green on all 3 acceptance scenarios
+2. `apps/core/exceptions.py` — `custom_exception_handler`
+3. `apps/core/utils.py` — `get_client_ip`
+4. `apps/audit/models.py` — `AuditAction`, `AuditLog`, `AuditLogQuerySet`, `AuditLogManager`
+5. `apps/audit/services.py` — `AuditService.append`
+6. `apps/storage/models.py` — `Folder`, `File`, `FileVersion`
+7. `apps/storage/services.py` — `get_storage_backend` factory, then `FileService`
+8. `apps/storage/serializers.py`
+9. `apps/storage/views.py`
+10. `apps/storage/urls.py`
+11. `apps/audit/serializers.py`
+12. `apps/audit/views.py`
+13. `apps/audit/urls.py`
+14. `apps/storage/admin.py`, `apps/audit/admin.py`
+15. `config/urls.py` — add includes
+16. `config/settings/base.py` — add upload size limits + EXCEPTION_HANDLER
+17. `makemigrations` + `migrate`
+18. `apps/core/management/commands/seed.py`
+19. `tests/unit/test_audit.py`
+20. `tests/integration/test_files.py`
+21. `tests/acceptance/test_core.py`
+22. `make check` (ruff + mypy) — must pass clean
+23. `make verify` — must be green on all 3 acceptance scenarios
 
 ---
 
@@ -710,13 +831,22 @@ changing method signatures.
 ## 10. Consistency Notes
 
 - **Response envelope:** All views return `{"data": ...}` on success and
-  `{"error": {"code": "...", "message": "..."}}` on error. This matches the pattern
-  already established in `apps/accounts/views.py`.
+  `{"error": {"code": "...", "message": "..."}}` on error. Enforced globally via
+  `custom_exception_handler` registered in `REST_FRAMEWORK`. Views raise DRF
+  exceptions (`rest_framework.exceptions.*`), not Django's built-in ones.
 - **`AuditService.append` signature:** Uses keyword-only arguments (`*`) to prevent
   argument-order bugs. All callers must use named args.
 - **`AuditLog` does not inherit `BaseModel`** — it must not have `updated_at`. This is
   the only model that deviates from `BaseModel`.
-- **Storage key format:** `{owner.id}/{file.id}/1/{file.name}`. In Phase 5, `1` becomes
-  `{version.version_number}`. The format is unchanged; only the version segment varies.
+- **Storage key format:** `{owner.id}/{file.id}/1/{safe_name}`. `safe_name` is
+  `Path(name).name` — directory components stripped at service level before key
+  construction. In Phase 5, `1` becomes `{version.version_number}`. The format is
+  unchanged; only the version segment varies.
+- **`FileService.download` return type:** `(File, FileVersion, BinaryIO)`. Views must
+  unpack all three. Never access `version.file` in the view — that would be an
+  implicit N+1 query.
+- **`file_obj.seek(0)` before storage save:** Must always be called explicitly in the
+  service, regardless of what preceded it. Do not rely on backend implementations to
+  seek internally.
 - **`make check` gate:** `ruff check` + `mypy --strict` must pass with zero errors after
   each step. Do not defer linting to end of phase.
