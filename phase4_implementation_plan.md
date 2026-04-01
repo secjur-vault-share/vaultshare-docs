@@ -349,8 +349,18 @@ class ShareService:
        ip=ip,
        revoked_share_id=str(share_id),
        revoked_user=share.shared_with.email,
+       permission=share.permission,  # capture the level that was revoked
    )
    ```
+
+   **Audit precision rationale:** Including the `permission` level in the revocation
+   audit entry is essential for security forensics. When reviewing the audit trail for
+   a file, investigators need to know not just *who* lost access, but *what level* of
+   access was revoked. A `REVOKE` entry without the permission level is ambiguous —
+   "was this a VIEWER being removed, or an EDITOR?" — and forces a join against the
+   (now-soft-deleted) share row, defeating the purpose of denormalized audit metadata.
+   The `share.permission` string is read before the revoke is committed, so it is
+   always available at this point.
 
 #### `ShareService.list_shared_with_me`
 
@@ -932,6 +942,46 @@ acceptance test suite. `make verify` now runs all 6 scenarios (3 from Phase 3 + 
 - `test_revoked_share_not_resolved`: Create file, share as VIEWER, revoke the share.
   Resolve → assert `None`.
 
+### Unit test: Exception Envelope (`tests/unit/test_exception_handler.py`) — NEW FILE
+
+This test verifies that the global exception handler in `apps/core/exceptions.py`
+correctly wraps DRF built-in exceptions into our custom `{ "error": { ... } }` envelope.
+This is critical: if DRF's default renderer is ever reinstated or the handler is
+misconfigured, these tests will catch it immediately rather than leaking non-envelope
+error shapes to API consumers.
+
+- `test_permission_denied_produces_error_envelope`: Simulate a view that raises
+  `rest_framework.exceptions.PermissionDenied`. Assert the response body is
+  `{"error": {"code": "PERMISSION_DENIED", "message": "..."}}` and the HTTP status
+  is 403. Do **not** check the exact message — only the shape and `code`.
+
+- `test_validation_error_produces_error_envelope`: Simulate a view that raises
+  `rest_framework.exceptions.ValidationError("some detail")`. Assert the response body
+  is `{"error": {"code": "VALIDATION_FAILED", "message": "..."}}` and the HTTP status
+  is 400.
+
+**Implementation note:** Use `pytest-django`'s `APIRequestFactory` to fabricate a
+request and call the handler directly:
+
+```python
+from rest_framework.exceptions import PermissionDenied, ValidationError
+from apps.core.exceptions import custom_exception_handler
+from rest_framework.views import exception_handler as drf_default_handler
+
+def test_permission_denied_produces_error_envelope(rf):
+    exc = PermissionDenied("You shall not pass.")
+    context = {"request": rf.get("/")}
+    response = custom_exception_handler(exc, context)
+    assert response.status_code == 403
+    assert response.data["error"]["code"] == "PERMISSION_DENIED"
+    assert "error" in response.data
+    assert "data" not in response.data  # must never have both keys
+```
+
+The dual assertion `"error" in response.data` and `"data" not in response.data` guards
+against an accidental hybrid envelope which would be valid JSON but violate the
+API contract.
+
 ### Integration tests (`tests/integration/test_sharing.py`) — NEW FILE
 
 - `test_share_file_creates_share_and_audit`: Owner shares file → assert `FileShare`
@@ -1019,7 +1069,8 @@ defined in the enum but unused until this feature is added.
 - **`AuditService.append` metadata:** Share and revoke events include `shared_with`
   (email) and `permission` (level name) in the `metadata` JSON field. This denormalizes
   the data for audit readability — the audit log must be interpretable without joining
-  to the share table.
+  to the share table. Revocation metadata additionally includes `permission` (the level
+  that was revoked) for security forensics — see Section D `ShareService.revoke`.
 - **Response envelope:** All new views return `{"data": ...}` on success. The global
   exception handler covers error responses. No manual error wrapping in views.
 - **Cross-app import:** `apps.sharing` imports from `apps.storage.models` (File, Folder)
@@ -1031,3 +1082,83 @@ defined in the enum but unused until this feature is added.
   cross-app communication through service calls.
 - **`make check` gate:** `ruff check` + `mypy --strict` must pass with zero errors after
   each step. Do not defer linting to end of phase.
+
+---
+
+## 11. Architectural Amendment — ContentTypes & `core` Consolidation (Decision Record)
+
+### Context
+
+The current plan (Section 10, "Cross-app import") acknowledges a **bidirectional
+dependency** between `apps.storage` and `apps.sharing`: storage calls `PermissionService`
+(in sharing), and sharing holds FKs to `File`/`Folder` (in storage). This is a circular
+dependency at the model level — a recognised sign of suboptimal decoupling.
+
+### Superior Alternative: Move Sharing Models into `apps/core` with ContentTypes
+
+The architecturally cleaner solution — appropriate if time budget allows — is to:
+
+1. **Move `FileShare`, `FolderShare`, and `PermissionService`** into `apps/core`,
+   replacing the concrete FK fields (`file = FK('storage.File')`) with Django
+   **Generic Foreign Keys** (`ContentType` + `object_id`):
+
+   ```python
+   # apps/core/models.py (new addition)
+   from django.contrib.contenttypes.fields import GenericForeignKey
+   from django.contrib.contenttypes.models import ContentType
+
+   class Share(BaseModel):
+       content_type = models.ForeignKey(ContentType, on_delete=models.CASCADE)
+       object_id = models.UUIDField()
+       target = GenericForeignKey('content_type', 'object_id')  # File or Folder
+
+       shared_with = models.ForeignKey(settings.AUTH_USER_MODEL, ...)
+       shared_by  = models.ForeignKey(settings.AUTH_USER_MODEL, ...)
+       permission = models.CharField(max_length=16, choices=...)
+       revoked_at = models.DateTimeField(null=True, blank=True)
+   ```
+
+2. **`PermissionService`** in `apps/core/services.py` calls a `get_owner(target)`
+   helper that each app registers. `apps.storage` calls a generic permission service in
+   `core`, but `core` has **zero hard imports from `storage`** — the dependency arrow is
+   now strictly one-way: `storage → core`.
+
+3. **App count reduction:** Merging into `core` collapses the project from 5 apps
+   (`core`, `accounts`, `storage`, `sharing`, `audit`) to **4 apps** — eliminating the
+   `sharing` bounded context entirely. For a 12-hour challenge, this is a meaningful
+   reduction in scaffolding overhead.
+
+### Why This Plan Does Not Implement It
+
+This plan keeps `apps/sharing` as a standalone app with concrete FKs for the following
+reasons:
+
+| Factor | Concrete FKs (current plan) | ContentTypes (superior) |
+|---|---|---|
+| **DB integrity** | Full referential integrity enforced by DB | No FK constraints on `object_id` — orphans possible |
+| **Query simplicity** | Standard ORM joins, type-checked by mypy | GFK lookups are not type-safe; requires `prefetch_related('content_type')` |
+| **Admin** | Inline admin on File/Folder with FK drill-down | GFK admin requires custom `GenericInlineAdmin` |
+| **Implementation time** | ~1.5h as budgeted | +30–45min for GFK wiring, ContentType registration, and mypy suppression |
+| **Circular dependency** | Acknowledged trade-off, contained within Django project | Eliminated |
+
+**Decision: Keep concrete FKs for Phase 4. Document ContentTypes as the production
+upgrade path in `CODE_REVIEW.md`.**
+
+If Phase 4 is completed significantly ahead of schedule (i.e., before the hour-4:45
+checkpoint), this migration should be considered before moving to Phase 5. The test
+suite would need to be re-run from scratch after the refactor.
+
+### Impact on `CODE_REVIEW.md`
+
+Add a `Warning`-severity finding:
+
+> **Bidirectional dependency between `storage` and `sharing`.**
+> `apps.sharing` holds concrete FKs to `storage.File` / `storage.Folder`, and
+> `apps.storage.services` imports `sharing.services.PermissionService`. The cleaner
+> production design is to move sharing models into `core` with Generic Foreign Keys
+> (ContentTypes), which eliminates the cycle and reduces app count from 5 to 4.
+> Accepted as a deliberate time-budget trade-off for this build.
+>
+> **Suggested fix (post-challenge):** Migrate `FileShare` / `FolderShare` to a single
+> `Share` model with `GenericForeignKey` in `apps/core`. Implement a `PermissionBackend`
+> protocol so `storage` resolves permissions without importing `sharing` directly.
